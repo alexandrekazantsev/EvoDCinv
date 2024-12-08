@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
-from disba import Ellipticity, depthplot, resample, surf96
+from disba import Ellipticity, depthplot, resample, surf96, DispersionError
 from disba._common import ifunc
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
@@ -86,6 +86,7 @@ class InversionResult(dict):
     def __add__(self, other):
         """Concatenate inversion results."""
         if not isinstance(other, InversionResult):
+            print(type(other))
             raise TypeError()
 
         if not self.keys():
@@ -158,6 +159,88 @@ class InversionResult(dict):
 
         return np.column_stack((d, mean_model))
 
+
+    def scatter_model_space(
+        self,
+        max_misfit=None,
+        model=None
+    ):
+        
+        idx = np.argsort(self.misfits)[::-1]
+        models = self.models[idx]
+        misfits = self.misfits[idx]
+    
+        # Select models withing misfit threshold
+        if max_misfit is not None:
+            models = models[misfits<=max_misfit]
+            misfits = misfits[misfits<=max_misfit]
+        
+        # Make colormap
+        norm = Normalize(misfits.min(), misfits.max())
+        cmap = 'viridis_r'
+        smap = ScalarMappable(norm, cmap)
+        smap.set_array([])
+        
+        # Make scatter plot per layer
+        n_layers = models.shape[1]
+        n_rows = int(np.ceil(np.sqrt(n_layers)))
+        n_cols = int(np.ceil(n_layers/n_rows))
+        fig, ax_list = plt.subplots(n_rows, n_cols, figsize=((n_cols+1)*3, n_rows*3))
+        for i in range(n_rows * n_cols):
+            i_row = i // n_cols
+            i_col = i % n_cols
+            ax_list[i_row, i_col].grid('on')
+            if i < n_layers - 1:
+                ax_list[i_row, i_col].scatter(models[:, i, 0], models[:, i, 2], color=smap.to_rgba(misfits), marker='.')
+                ax_list[i_row, i_col].set_xlabel('Thickness (km)')
+                ax_list[i_row, i_col].set_ylabel('Vs (km/s)')
+                ax_list[i_row, i_col].set_title('Layer ' + str(i+1))
+                if model is not None:
+                    x1 = min(model.layers[i].thickness)
+                    x2 = max(model.layers[i].thickness)
+                    y1 = min(model.layers[i].velocity_s)
+                    y2 = max(model.layers[i].velocity_s)
+                    # Plot horizontal lines at y1 and y2, spanning from x1 to x2
+                    ax_list[i_row, i_col].plot([x1, x2], [y1, y1], color='k')  # Horizontal line at y1
+                    ax_list[i_row, i_col].plot([x1, x2], [y2, y2], color='k')  # Horizontal line at y2
+
+                    # Plot vertical lines at x1 and x2, spanning from y1 to y2
+                    ax_list[i_row, i_col].plot([x1, x1], [y1, y2], color='k')   # Vertical line at x1
+                    ax_list[i_row, i_col].plot([x2, x2], [y1, y2], color='k')   # Vertical line at x2
+
+                    # Set axis limits with a small margin around the lines
+                    x_margin = (x2 - x1) * 0.05
+                    y_margin = (y2 - y1) * 0.05
+                    ax_list[i_row, i_col].set_xlim(x1 - x_margin, x2 + x_margin)
+                    ax_list[i_row, i_col].set_ylim(y1 - y_margin, y2 + y_margin)
+            elif i == n_layers - 1:
+                ax_list[i_row, i_col].scatter(misfits, models[:, i, 2],  marker='.', color=smap.to_rgba(misfits))
+                ax_list[i_row, i_col].set_xlabel('Misfit')
+                ax_list[i_row, i_col].set_ylabel('Vs (km/s)')
+                ax_list[i_row, i_col].set_title('Half-space')
+                if model is not None:
+                    y1 = min(model.layers[i].velocity_s)
+                    y2 = max(model.layers[i].velocity_s)
+                    x1 = min(misfits)
+                    x2 = max(misfits)
+                    # Plot horizontal lines at y1 and y2, spanning from x1 to x2
+                    ax_list[i_row, i_col].plot([x1, x2], [y1, y1], color='k')  # Horizontal line at y1
+                    ax_list[i_row, i_col].plot([x1, x2], [y2, y2], color='k')  # Horizontal line at y2
+
+                    # Set axis limits with a small margin around the lines
+                    y_margin = (y2 - y1) * 0.05
+                    ax_list[i_row, i_col].set_ylim(y1 - y_margin, y2 + y_margin)
+            else:
+                ax_list[i_row, i_col].axis('off')
+        
+        
+        smap.set_array([])  # Required to use smap in colorbar
+        cbar_ax = fig.add_axes([0.85, 0.15, 0.03, 0.7])
+        plt.colorbar(smap, label='Misfit', cax=cbar_ax)
+        plt.tight_layout(rect=[0, 0, 0.85, 1])
+        return fig, ax_list
+
+
     def plot_curve(
         self,
         period,
@@ -169,6 +252,7 @@ class InversionResult(dict):
         n_jobs=-1,
         dc=0.001,
         dt=0.01,
+        max_misfit=None,
         plot_args=None,
         ax=None,
     ):
@@ -211,36 +295,40 @@ class InversionResult(dict):
         if type in {"phase", "group"}:
 
             def get_y(thickness, velocity_p, velocity_s, density):
-                c = surf96(
-                    period,
-                    thickness,
-                    velocity_p,
-                    velocity_s,
-                    density,
-                    mode,
-                    itype[type],
-                    ifunc["dunkin"][wave],
-                    dc,
-                    dt,
-                )
-                idx = c > 0.0
-
-                return c[idx]
+                try:
+                    c = surf96(
+                        period,
+                        thickness,
+                        velocity_p,
+                        velocity_s,
+                        density,
+                        mode,
+                        itype[type],
+                        ifunc["dunkin"][wave],
+                        dc,
+                        dt,
+                    )
+                    idx = c > 0.0
+                    return (True, c[idx])
+                except DispersionError as e:
+                    return (False, str(e))
 
         else:
 
             def get_y(thickness, velocity_p, velocity_s, density):
-                ell = Ellipticity(
-                    thickness,
-                    velocity_p,
-                    velocity_s,
-                    density,
-                    "dunkin",
-                    dc,
-                )
-                rel = ell(period, mode)
-
-                return np.abs(rel.ellipticity)
+                try:
+                    ell = Ellipticity(
+                        thickness,
+                        velocity_p,
+                        velocity_s,
+                        density,
+                        "dunkin",
+                        dc,
+                    )
+                    rel = ell(period, mode)
+                    return (True, np.abs(rel.ellipticity))
+                except DispersionError as e:
+                    return (False, str(e))
 
         # Plot arguments
         plot_args = plot_args if plot_args is not None else {}
@@ -274,6 +362,11 @@ class InversionResult(dict):
             models = self.models[idx]
             misfits = self.misfits[idx]
 
+            # Select models withing misfit threshold
+            if max_misfit is not None:
+                models = models[misfits<=max_misfit]
+                misfits = misfits[misfits<=max_misfit]
+
             # Skip models
             models = models[::stride]
             misfits = misfits[::stride]
@@ -284,9 +377,11 @@ class InversionResult(dict):
             smap.set_array([])
 
             # Generate and plot curves
-            curves = Parallel(n_jobs=n_jobs)(
+            results = Parallel(n_jobs=n_jobs)(
                 delayed(get_y)(*model.T) for model in models
             )
+            curves = [res[1] for res in results if res[0]]
+            errors = [res[1] for res in results if not res[0]]
             for curve, misfit in zip(curves, misfits):
                 y = (
                     1.0 / curve
@@ -294,9 +389,13 @@ class InversionResult(dict):
                     else curve
                 )
                 plot(x[: len(y)], y, color=smap.to_rgba(misfit), **_plot_args)
+            
+            # Add colorbar based on misfit values
+            smap.set_array([])  # Required to use smap in colorbar
+            plt.colorbar(smap, label='Misfit')
 
         elif show == "best":
-            curve = get_y(*self.model.T)
+            _, curve = get_y(*self.model.T)
             y = (
                 1.0 / curve
                 if "type" != "ellipticity" and yaxis == "slowness"
@@ -324,6 +423,7 @@ class InversionResult(dict):
         show="best",
         stride=1,
         dz=None,
+        max_misfit=None,
         plot_args=None,
         ax=None,
     ):
@@ -387,6 +487,11 @@ class InversionResult(dict):
             idx = np.argsort(self.misfits)[::-1]
             models = self.models[idx]
             misfits = self.misfits[idx]
+            
+            # Select models withing misfit threshold
+            if max_misfit is not None:
+                models = models[misfits<=max_misfit]
+                misfits = misfits[misfits<=max_misfit]
 
             # Skip models
             models = models[::stride]
@@ -402,6 +507,10 @@ class InversionResult(dict):
                 tmp = {k: v for k, v in _plot_args.items()}
                 tmp["color"] = smap.to_rgba(misfit)
                 depthplot(model[:, 0], model[:, i], zmax, plot_args=tmp, ax=ax)
+            
+            # Add colorbar based on misfit values
+            smap.set_array([])  # Required to use smap in colorbar
+            plt.colorbar(smap, label='Misfit')
 
         else:
             model = self.model if show == "best" else self.mean(dz, zmax)

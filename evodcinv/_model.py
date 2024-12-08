@@ -371,6 +371,7 @@ class EarthModel:
             return results
 
         else:
+            # out = results[0].copy()
             out = InversionResult()
             for result in results:
                 out += result
